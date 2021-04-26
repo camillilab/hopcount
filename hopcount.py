@@ -25,13 +25,9 @@ REQUIREMENTS:
 Author: jacob.bourgeois@tufts.edu
 Affiliation - Camilli Laboratory, Tufts University Graduate School of Biomedical Sciences, Molecular Microbiology
 
-Version: 1.0
-- Rewrite of the flow of the program to be able automatically bin reads that fail percent thresholding to adjacent
- intergenic regions
-- Fixes various bugs in reporting
-- Various optimizations
-- Now reports approximate complexity, defined as the number of CDS inserted over the total possible CDS, and other stats
-- This is intended to be the first stable release to accompany the CSHL Handbook
+Version: 1.01 2021-04-26
+- User can now independently specify percent thresholding on CDS for 5' and 3' ends
+- User can now declare maximum amount of mismatches allowed in the output using the SAM XM::i:<N> flag.
 """
 
 
@@ -343,7 +339,7 @@ def generate_ig_regions(cds_data, is_circular, genome_lengths):
 
 
 # Obtains a transposition read histogram from a SAM file
-def get_transp_read_pos(sam_file, qual_cutoff):
+def get_transp_read_pos(sam_file, qual_cutoff, max_mismatches=1000):
 
     # Nasty layered defaultdict to handle multiple genomic elements in one SAM file
     pos_histogram = defaultdict(lambda: defaultdict(lambda: [0, 0, []]))  # Position histogram of transposition events.
@@ -377,37 +373,42 @@ def get_transp_read_pos(sam_file, qual_cutoff):
             # Do quality cutoff
 
             if read_mapq >= qual_cutoff:
-                rows_included += 1
 
-                # Regarding the bitval, 0 is pos strand, and 16 is reverse strand, if the reads aligned
-                if read_strand_bitval == '0':
+                # Do mismatch cutoff
+                read_num_mismatches = int(read[13].split(':')[2])
+                if read_num_mismatches <= max_mismatches:
 
-                    # If the read_strand is positive, the read_pos obtained is proximal to the transposition site
-                    # Thus, add one to the position in the read
-                    # pos_histogram[read_pos][1] += 1
-                    pos_histogram[read_chromosome][read_pos][0] += 1
-                    pos_histogram[read_chromosome][read_pos][2].append(read_mapq)
-                    match_rows_included += 1
+                    rows_included += 1
 
-                elif read_strand_bitval == '16':
+                    # Regarding the bitval, 0 is pos strand, and 16 is reverse strand, if the reads aligned
+                    if read_strand_bitval == '0':
 
-                    # If the read strand is negative, then the read_pos is distal to the transposition site
-                    # Thus, add the read length to the obtained read_pos, and index that in the dict
-                    transp_read_pos = str(int(read_pos) + read_length)
-                    pos_histogram[read_chromosome][transp_read_pos][1] += 1
-                    pos_histogram[read_chromosome][transp_read_pos][2].append(read_mapq)
-                    match_rows_included += 1
+                        # If the read_strand is positive, the read_pos obtained is proximal to the transposition site
+                        # Thus, add one to the position in the read
+                        # pos_histogram[read_pos][1] += 1
+                        pos_histogram[read_chromosome][read_pos][0] += 1
+                        pos_histogram[read_chromosome][read_pos][2].append(read_mapq)
+                        match_rows_included += 1
 
-                else:
-                    read_strand = 'UNKNOWN'
-                    # print("Warning! Unexpected read flag: {0}".format(read_strand_bitval))
+                    elif read_strand_bitval == '16':
+
+                        # If the read strand is negative, then the read_pos is distal to the transposition site
+                        # Thus, add the read length to the obtained read_pos, and index that in the dict
+                        transp_read_pos = str(int(read_pos) + read_length)
+                        pos_histogram[read_chromosome][transp_read_pos][1] += 1
+                        pos_histogram[read_chromosome][transp_read_pos][2].append(read_mapq)
+                        match_rows_included += 1
+
+                    else:
+                        read_strand = 'UNKNOWN'
+                        # print("Warning! Unexpected read flag: {0}".format(read_strand_bitval))
 
     # Now for each pos, go ahead and merge the fastq scores
     for chrom in pos_histogram:
         for entry in pos_histogram[chrom]:
             pos_histogram[chrom][entry][2] = mean(pos_histogram[chrom][entry][2])
 
-    hop_stats = "{0} of {1} reads passed MAPQ quality threshold of {2} ({3:.2f}%)".format(rows_included, total_rows, qual_cutoff, 100*rows_included/total_rows)
+    hop_stats = "{0} of {1} reads passed MAPQ quality threshold of {2} and mismatch threshold of {4} ({3:.2f}%)".format(rows_included, total_rows, qual_cutoff, 100*rows_included/total_rows, max_mismatches)
     print(hop_stats)
 
     return pos_histogram, hop_stats
@@ -470,6 +471,8 @@ def get_genomic_context(genes, pos):
 def threshold_gene_list(input_gene_list, percent_threshold, is_circular, genome_lengths):
 
     thresholded_entries = dict()
+    fiveprime_percent_threshold = float(percent_threshold.split(',')[0])
+    threeprime_percent_threshold = float(percent_threshold.split(',')[1])
 
     for chromosome in input_gene_list:
 
@@ -479,8 +482,8 @@ def threshold_gene_list(input_gene_list, percent_threshold, is_circular, genome_
 
             start = entry.location.start
             end = entry.location.end
-            threshold_start = start + math.ceil(percent_threshold * (end - start))
-            threshold_end = end - math.ceil(percent_threshold * (end - start))
+            threshold_start = start + math.ceil(fiveprime_percent_threshold * (end - start))
+            threshold_end = end - math.ceil(threeprime_percent_threshold * (end - start))
 
             # Create a new SeqFeature
             new_entry = SeqFeature(FeatureLocation(threshold_start, threshold_end), type='CDS',
@@ -508,6 +511,9 @@ def write_hopcount_file(out, thresholded_gene_list, histogram, original_gene_lis
         multiple_entries = 0
         total_unique_entries = set()
         total_genome_length = 0
+
+        fiveprime_percent_threshold = float(percent_cutoff.split(',')[0])
+        threeprime_percent_threshold = float(percent_cutoff.split(',')[1])
 
         for chrom in sorted(histogram):
 
@@ -551,14 +557,14 @@ def write_hopcount_file(out, thresholded_gene_list, histogram, original_gene_lis
                         total_unique_entries.add(pos)
 
                     else:
-                        # This position landed in an intergenic region that arose from aritfical CDS shortening
+                        # This position landed in an intergenic region that arose from artificial CDS shortening
                         tossed_positions += 1
                         pass
 
     insertional_density = total_genome_length / len(total_unique_entries)
 
     stat_payload = ["Total unique positions in histogram: {0}".format(total_positions),
-                    "Wrote {0} entries to file, tossed {2} entries [PERCENT_WITHIN_READ_CUTOFF = {1}%]".format(write_positions, percent_cutoff*100, tossed_positions),
+                    "Wrote {0} entries to file, tossed {2} entries [5' cutoff = {1}%, 3' cutoff = {3}%]".format(write_positions, fiveprime_percent_threshold*100, tossed_positions, threeprime_percent_threshold*100),
                     "{0} positions fell under two or more CDS regions".format(multiple_entries),
                     "Total unique positions written: {0}".format(len(total_unique_entries)),
                     "Approximate positional complexity (before read count thresholding): 1 insertion per {0:.2f} bp".format(
@@ -1253,7 +1259,7 @@ def main(ref, reads, output, bt2ops, hopcops):
     gene_info, genome_lengths, split_cds, cds_lengths = extract_gene_info(gbk=ref, is_circular=hopcops['var_circular_genome'])
 
     # Generate a thresholded gene list
-    threshold_cds = threshold_gene_list(gene_info, percent_threshold=float(hopcops['var_percent_cutoff']),
+    threshold_cds = threshold_gene_list(gene_info, percent_threshold=hopcops['var_percent_cutoff'],
                                         genome_lengths=genome_lengths, is_circular=hopcops['var_circular_genome'])
 
     # 1b Create a list of all possible intergenic entries based on CDS data
@@ -1304,7 +1310,7 @@ def main(ref, reads, output, bt2ops, hopcops):
 
         # 3a Obtain a position histogram from the sam file
         print("Obtaining transposition read position histogram from sam file...")
-        transposition_read_histogram, hopcount_stats = get_transp_read_pos(sam_file_loc, int(hopcops['var_quality']))
+        transposition_read_histogram, hopcount_stats = get_transp_read_pos(sam_file_loc, int(hopcops['var_quality']), int(hopcops['var_max_mismatches']))
 
         runtime_config_payload.append(hopcount_stats)
 
@@ -1314,7 +1320,7 @@ def main(ref, reads, output, bt2ops, hopcops):
         hopcount_file_path = os.path.join(file_output_dir, file_output_name+'_hopcount.tsv')
         print("Obtaining genomic context and writing hopcount data to {0}...".format(hopcount_file_path))
         write_stats = write_hopcount_file(hopcount_file_path, threshold_cds, transposition_read_histogram,
-                                          gene_info, percent_cutoff=float(hopcops['var_percent_cutoff']),
+                                          gene_info, percent_cutoff=hopcops['var_percent_cutoff'],
                                           genome_lengths=genome_lengths)
 
         runtime_config_payload += write_stats
